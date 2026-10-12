@@ -16,7 +16,6 @@ import {
   getSavedDevices,
   saveAllDevices,
   loadUserSession,
-  clearAllUserData,
   UserSession,
 } from '../services/storage';
 import {
@@ -28,12 +27,11 @@ import {
 } from '../services/deviceService';
 import { SapthaDevice, DeviceStates } from '../types/device';
 import { auth } from '../services/firebase';
-
 interface HomeScreenProps {
   navigation: any;
 }
 
-const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
+export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
   const [rooms, setRooms] = useState<string[]>([]);
   const [devices, setDevices] = useState<SapthaDevice[]>([]);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
@@ -57,7 +55,6 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
       let finalRooms = [...localRooms];
       let finalDevices = [...localDevices];
 
-      // Restore rooms and boards from cloud if user is signed in
       if (!isGuest && currentUser) {
         try {
           const [cloudRooms, cloudBoards] = await Promise.all([
@@ -164,7 +161,6 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
 
     setIsRoomModalOpen(false);
   };
-
 
   const getRoomStats = (roomName: string) => {
     const roomDevices = devices.filter((d) => d.room === roomName);
@@ -387,7 +383,6 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.6,
   },
-  addDeviceLink: { fontSize: 13, fontWeight: '700', color: '#38bdf8' },
   emptyContainer: {
     backgroundColor: '#1e293b',
     borderRadius: 16,
@@ -425,5 +420,4 @@ const styles = StyleSheet.create({
   activeText: { fontSize: 11, color: '#38bdf8', marginTop: 2, fontWeight: '600' },
 });
 
-export { HomeScreen };
 export default HomeScreen;

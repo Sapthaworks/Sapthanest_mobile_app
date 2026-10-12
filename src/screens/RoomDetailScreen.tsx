@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,14 +9,13 @@ import {
   Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { auth } from '../services/firebase';
 import { RelayCard } from '../components/RelayCard';
 import { TriacCard } from '../components/TriacCard';
 import {
   subscribeToDeviceState,
   updateChannelState,
   unlinkDeviceFromUser,
-  deleteRoomFromFirebase,
+  isAnonymousUser,
 } from '../services/deviceService';
 import { sendDynamicChannelCommand } from '../services/localApi';
 import {
@@ -25,12 +24,14 @@ import {
   deleteRoomAndItsDevices,
 } from '../services/storage';
 import { DeviceStates, RelayKey, TriacKey, SapthaDevice } from '../types/device';
+import { auth } from '../services/firebase';
 
 export interface RoomDetailScreenProps {
   route?: {
     params?: {
       roomId?: string;
       roomName?: string;
+      userId?: string;
     };
   };
   navigation?: any;
@@ -38,6 +39,9 @@ export interface RoomDetailScreenProps {
 
 export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navigation }) => {
   const roomName = route?.params?.roomName || 'Living Room';
+  const currentUserId = route?.params?.userId || 'default_user';
+
+  const isGuest = auth.currentUser?.isAnonymous || isAnonymousUser();
 
   const [devices, setDevices] = useState<SapthaDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
@@ -51,6 +55,8 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
     t1: 0,
     t2: 0,
   });
+
+  const pendingUpdatesRef = useRef<Record<string, number>>({});
 
   const loadRoomDevices = useCallback(async () => {
     try {
@@ -75,80 +81,115 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 
   useEffect(() => {
     loadRoomDevices();
-    const unsubscribe = navigation?.addListener('focus', () => {
+    const unsubscribe = navigation.addListener('focus', () => {
       loadRoomDevices();
     });
     return unsubscribe;
   }, [navigation, loadRoomDevices]);
 
-  // Real-time Cloud Stream Sync
   useEffect(() => {
-    if (!selectedDeviceId) return;
+    if (!selectedDeviceId || isGuest) return;
 
     const unsubscribe = subscribeToDeviceState(selectedDeviceId, (cloudState) => {
-      if (cloudState) {
-        setStates(cloudState);
-      }
+      if (!cloudState) return;
+
+      const now = Date.now();
+      setStates((prev) => {
+        const next = { ...prev };
+        (['r1', 'r2', 'r3', 'r4', 't1', 't2'] as (RelayKey | TriacKey)[]).forEach((ch) => {
+          const lockedUntil = pendingUpdatesRef.current[ch] || 0;
+          if (now > lockedUntil) {
+            (next as any)[ch] = (cloudState as any)[ch];
+          }
+        });
+        return next;
+      });
     });
 
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [selectedDeviceId]);
+  }, [selectedDeviceId, isGuest]);
 
   const activeDevice = devices.find((d) => d.id === selectedDeviceId);
 
-  // Relay command dispatcher (Dynamic mDNS -> Local Dynamic IP -> Cloud)
   const handleRelayToggle = async (channel: RelayKey, nextState: boolean) => {
     if (!selectedDeviceId || !activeDevice) return;
 
+    pendingUpdatesRef.current[channel] = Date.now() + 1200;
     setStates((prev) => ({ ...prev, [channel]: nextState }));
 
+    // Local request includes hardware authorization key
     const localSuccess = await sendDynamicChannelCommand(
       {
         id: activeDevice.id,
         mdns: activeDevice.mdns,
         ip: activeDevice.ip,
+        token: activeDevice.token,
       },
       channel,
       nextState,
       0
     );
 
-    if (!localSuccess) {
-      try {
-        await updateChannelState(selectedDeviceId, channel, nextState);
-      } catch (cloudErr) {
-        console.error('Relay update failed:', cloudErr);
-        Alert.alert('Command Failed', 'Could not reach board via dynamic mDNS or cloud.');
+    if (isGuest) {
+      if (!localSuccess) {
+        delete pendingUpdatesRef.current[channel];
         setStates((prev) => ({ ...prev, [channel]: !nextState }));
+        Alert.alert(
+          'Local Connection Required',
+          'Guest mode only controls devices on the local Wi-Fi network. Ensure your phone is connected to the same Wi-Fi.'
+        );
+      }
+      return;
+    }
+
+    try {
+      await updateChannelState(selectedDeviceId, channel, nextState);
+    } catch (err) {
+      if (!localSuccess) {
+        delete pendingUpdatesRef.current[channel];
+        setStates((prev) => ({ ...prev, [channel]: !nextState }));
+        Alert.alert('Command Failed', 'Unable to reach board over local network or cloud.');
       }
     }
   };
 
-  // Triac Dimmer command dispatcher
   const handleTriacChange = async (channel: TriacKey, nextValue: number) => {
     if (!selectedDeviceId || !activeDevice) return;
 
+    pendingUpdatesRef.current[channel] = Date.now() + 1000;
     setStates((prev) => ({ ...prev, [channel]: nextValue }));
 
+    // Local request includes hardware authorization key
     const localSuccess = await sendDynamicChannelCommand(
       {
         id: activeDevice.id,
         mdns: activeDevice.mdns,
         ip: activeDevice.ip,
+        token: activeDevice.token,
       },
       channel,
       nextValue > 0,
       nextValue
     );
 
-    if (!localSuccess) {
-      try {
-        await updateChannelState(selectedDeviceId, channel, nextValue);
-      } catch (cloudErr) {
-        console.error('Dimmer update failed:', cloudErr);
-        Alert.alert('Routing Failed', 'Unable to adjust phase regulator level.');
+    if (isGuest) {
+      if (!localSuccess) {
+        delete pendingUpdatesRef.current[channel];
+        Alert.alert(
+          'Local Connection Required',
+          'Guest mode only controls devices on the local Wi-Fi network.'
+        );
+      }
+      return;
+    }
+
+    try {
+      await updateChannelState(selectedDeviceId, channel, nextValue);
+    } catch (err) {
+      if (!localSuccess) {
+        delete pendingUpdatesRef.current[channel];
       }
     }
   };
@@ -156,7 +197,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
   const handleDeleteDevice = (deviceId: string) => {
     Alert.alert(
       'Remove Board',
-      'This will delete the board from your device and unlink it from your cloud account. Proceed?',
+      'Are you sure you want to remove this board? It will be permanently deleted from both this phone and the cloud database.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -164,31 +205,15 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
           style: 'destructive',
           onPress: async () => {
             try {
-              const currentUser = auth.currentUser;
-              const uid = currentUser?.uid;
-
-              const [localResult, cloudResult] = await Promise.allSettled([
-                deleteDeviceFromStorage(deviceId),
-                uid && !currentUser.isAnonymous
-                  ? unlinkDeviceFromUser(uid, deviceId)
-                  : Promise.resolve(),
-              ]);
-
-              if (localResult.status === 'rejected') {
-                throw new Error('Failed to delete board from local storage.');
+              if (!isGuest) {
+                await unlinkDeviceFromUser(currentUserId, deviceId);
               }
-
-              if (cloudResult.status === 'rejected') {
-                console.warn('Cloud unlink failed or partially failed:', cloudResult.reason);
-              }
-
-              const updated = localResult.value;
+              const updated = await deleteDeviceFromStorage(deviceId);
               const remaining = updated.filter((d) => d.room === roomName);
               setDevices(remaining);
               setSelectedDeviceId(remaining.length > 0 ? remaining[0].id : '');
-            } catch (err: any) {
-              console.error('Failed to unlink device:', err);
-              Alert.alert('Error', err.message || 'Failed to remove board.');
+            } catch {
+              Alert.alert('Error', 'Failed to remove board.');
             }
           },
         },
@@ -199,7 +224,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
   const handleDeleteRoom = () => {
     Alert.alert(
       'Delete Room',
-      `Are you sure you want to delete "${roomName}"? This will delete the room and unlink all ${devices.length} board(s) from local storage and your cloud account.`,
+      `Delete "${roomName}"? This will permanently delete all ${devices.length} board(s) from this phone and the cloud database.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -207,21 +232,15 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
           style: 'destructive',
           onPress: async () => {
             try {
-              const currentUser = auth.currentUser;
-              const uid = currentUser?.uid;
-
-              if (uid && !currentUser.isAnonymous) {
-                await Promise.allSettled([
-                  ...devices.map((d) => unlinkDeviceFromUser(uid, d.id)),
-                  deleteRoomFromFirebase(uid, roomName),
-                ]);
+              if (!isGuest) {
+                for (const device of devices) {
+                  await unlinkDeviceFromUser(currentUserId, device.id);
+                }
               }
-
               await deleteRoomAndItsDevices(roomName);
               navigation?.goBack();
-            } catch (err: any) {
-              console.error('Failed to delete room:', err);
-              Alert.alert('Error', 'Failed to delete room. Please try again.');
+            } catch {
+              Alert.alert('Error', 'Failed to delete room.');
             }
           },
         },
@@ -238,9 +257,6 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
     );
   }
 
-  const isLocal =
-    activeDevice?.connectionMode === 'local' ||
-    (!activeDevice?.connectionMode && Boolean(activeDevice?.ip));
   const activeDomain =
     activeDevice?.mdns ||
     (activeDevice?.id
@@ -250,7 +266,6 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.container}>
-        {/* Navigation & Header Actions */}
         <View style={styles.headerRow}>
           <TouchableOpacity style={styles.backBtn} onPress={() => navigation?.goBack()}>
             <Text style={styles.backBtnText}>‹ Back</Text>
@@ -267,64 +282,33 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 
             <TouchableOpacity
               style={styles.scanButton}
-              onPress={() => navigation?.navigate('AddDevice', { roomName })}
+              onPress={() => navigation.navigate('AddDevice', { roomName, userId: currentUserId })}
             >
               <Text style={styles.scanButtonText}>+ Add ESP32</Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Board Meta Banner with Dynamic Origin Badges */}
-        {activeDevice ? (
-          <View
-            style={[
-              styles.deviceMetaCard,
-              isLocal ? styles.metaCardBorderLocal : styles.metaCardBorderCloud,
-            ]}
-          >
-            <View style={{ flex: 1 }}>
-              <View style={styles.badgeRow}>
-                <Text style={styles.deviceCardTitle}>
-                  {activeDevice.name || activeDevice.id}
-                </Text>
-                <View
-                  style={[
-                    styles.connectionBadge,
-                    isLocal ? styles.badgeLocal : styles.badgeCloud,
-                  ]}
-                >
-                  <View
-                    style={[
-                      styles.badgeDot,
-                      { backgroundColor: isLocal ? '#10b981' : '#38bdf8' },
-                    ]}
-                  />
-                  <Text
-                    style={[
-                      styles.badgeText,
-                      { color: isLocal ? '#34d399' : '#38bdf8' },
-                    ]}
-                  >
-                    {isLocal ? 'LAN / Direct' : 'Cloud / Remote'}
-                  </Text>
-                </View>
-              </View>
+        {isGuest && (
+          <View style={styles.guestNoticeBanner}>
+            <Text style={styles.guestNoticeText}>
+              🔒 Guest Mode: Operating strictly over local Wi-Fi. Cloud sync is disabled.
+            </Text>
+          </View>
+        )}
 
-              <Text style={styles.deviceCardDomain}>
-                {isLocal
-                  ? `${activeDomain}\n${activeDevice.ip}`
-                  : 'Synced via Firebase RTDB'}
+        {activeDevice ? (
+          <View style={styles.deviceMetaCard}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.deviceCardTitle}>
+                {activeDevice.name || activeDevice.id}
               </Text>
+              <Text style={styles.deviceCardDomain}>{activeDomain}</Text>
 
               <View style={styles.statusBadgeRow}>
-                <View
-                  style={[
-                    styles.onlineDot,
-                    { backgroundColor: isLocal ? '#10b981' : '#38bdf8' },
-                  ]}
-                />
+                <View style={styles.onlineDot} />
                 <Text style={styles.statusBadgeText}>
-                  {isLocal ? 'Zero-Latency Local HTTP Active' : 'Cloud EventStream Active'}
+                  {isGuest ? 'Local Control (Secured)' : 'Cloud & Local Secured'}
                 </Text>
               </View>
             </View>
@@ -344,37 +328,23 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
             </Text>
             <TouchableOpacity
               style={styles.noDeviceAction}
-              onPress={() => navigation?.navigate('AddDevice', { roomName })}
+              onPress={() => navigation.navigate('AddDevice', { roomName, userId: currentUserId })}
             >
               <Text style={styles.noDeviceActionText}>+ Link New ESP32</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {/* Board Selector Chips */}
         {devices.length > 1 && (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipRow}>
             {devices.map((device) => {
               const active = device.id === selectedDeviceId;
-              const deviceIsLocal =
-                device.connectionMode === 'local' ||
-                (!device.connectionMode && Boolean(device.ip));
               return (
                 <TouchableOpacity
                   key={device.id}
-                  style={[
-                    styles.deviceChip,
-                    active && styles.deviceChipActive,
-                    deviceIsLocal ? styles.deviceChipLocal : styles.deviceChipCloud,
-                  ]}
+                  style={[styles.deviceChip, active && styles.deviceChipActive]}
                   onPress={() => setSelectedDeviceId(device.id)}
                 >
-                  <View
-                    style={[
-                      styles.chipDot,
-                      { backgroundColor: deviceIsLocal ? '#10b981' : '#38bdf8' },
-                    ]}
-                  />
                   <Text style={[styles.deviceChipText, active && styles.deviceChipTextActive]}>
                     {device.name || device.id}
                   </Text>
@@ -384,7 +354,6 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
           </ScrollView>
         )}
 
-        {/* Channel Controls */}
         {activeDevice && (
           <>
             <Text style={styles.sectionTitle}>AC Relays (Switches)</Text>
@@ -440,47 +409,26 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#0b0f19' },
   container: { padding: 20, paddingBottom: 40 },
-  centerContainer: {
-    flex: 1,
-    backgroundColor: '#0b0f19',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
+  centerContainer: { flex: 1, backgroundColor: '#0b0f19', justifyContent: 'center', alignItems: 'center' },
   loadingText: { color: '#94a3b8', marginTop: 12, fontSize: 14 },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
+  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   backBtn: { paddingVertical: 6, paddingHorizontal: 4 },
   backBtnText: { color: '#38bdf8', fontSize: 16, fontWeight: '700' },
-  roomTitle: {
-    fontSize: 19,
-    fontWeight: '800',
-    color: '#f8fafc',
-    flex: 1,
-    textAlign: 'center',
-    marginHorizontal: 8,
-  },
+  roomTitle: { fontSize: 19, fontWeight: '800', color: '#f8fafc', flex: 1, textAlign: 'center', marginHorizontal: 8 },
   headerActionGroup: { flexDirection: 'row', alignItems: 'center' },
-  deleteRoomButton: {
-    backgroundColor: '#3f1d24',
-    borderWidth: 1,
-    borderColor: '#7f1d1d',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 8,
-    marginRight: 8,
-  },
+  deleteRoomButton: { backgroundColor: '#3f1d24', borderWidth: 1, borderColor: '#7f1d1d', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8, marginRight: 8 },
   deleteRoomButtonText: { color: '#f87171', fontWeight: '700', fontSize: 12 },
-  scanButton: {
-    backgroundColor: '#0284c7',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
+  scanButton: { backgroundColor: '#0284c7', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
   scanButtonText: { color: '#ffffff', fontWeight: '700', fontSize: 12 },
+  guestNoticeBanner: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#0284c7',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  guestNoticeText: { color: '#38bdf8', fontSize: 12, fontWeight: '600', textAlign: 'center' },
   deviceMetaCard: {
     backgroundColor: '#1e293b',
     borderRadius: 14,
@@ -492,49 +440,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#334155',
   },
-  metaCardBorderLocal: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
-  },
-  metaCardBorderCloud: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#0284c7',
-  },
-  badgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  connectionBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  badgeLocal: {
-    backgroundColor: '#064e3b',
-    borderWidth: 1,
-    borderColor: '#059669',
-  },
-  badgeCloud: {
-    backgroundColor: '#0c4a6e',
-    borderWidth: 1,
-    borderColor: '#0284c7',
-  },
-  badgeDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    marginRight: 4,
-  },
-  badgeText: {
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.4,
-  },
   deviceCardTitle: { fontSize: 15, fontWeight: '800', color: '#ffffff' },
   deviceCardDomain: {
     fontSize: 13,
@@ -543,22 +448,9 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 0.3,
   },
-  statusBadgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 6,
-  },
-  onlineDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 3.5,
-    marginRight: 6,
-  },
-  statusBadgeText: {
-    fontSize: 11,
-    color: '#94a3b8',
-    fontWeight: '600',
-  },
+  statusBadgeRow: { flexDirection: 'row', alignItems: 'center', marginTop: 6 },
+  onlineDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: '#10b981', marginRight: 6 },
+  statusBadgeText: { fontSize: 11, color: '#94a3b8', fontWeight: '600' },
   deleteBtn: {
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -579,38 +471,19 @@ const styles = StyleSheet.create({
   },
   noDeviceTitle: { color: '#f8fafc', fontSize: 16, fontWeight: '700', marginBottom: 4 },
   noDeviceSub: { color: '#94a3b8', fontSize: 12, textAlign: 'center', marginBottom: 14 },
-  noDeviceAction: {
-    backgroundColor: '#0284c7',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 8,
-  },
+  noDeviceAction: { backgroundColor: '#0284c7', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
   noDeviceActionText: { color: '#ffffff', fontWeight: '700', fontSize: 13 },
   chipRow: { flexDirection: 'row', marginBottom: 16 },
   deviceChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
     backgroundColor: '#1e293b',
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 20,
     marginRight: 8,
     borderWidth: 1,
     borderColor: '#334155',
   },
-  deviceChipLocal: {
-    borderColor: '#059669',
-  },
-  deviceChipCloud: {
-    borderColor: '#0284c7',
-  },
-  deviceChipActive: { backgroundColor: '#0f172a' },
-  chipDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    marginRight: 6,
-  },
+  deviceChipActive: { backgroundColor: '#0284c7', borderColor: '#38bdf8' },
   deviceChipText: { color: '#94a3b8', fontSize: 13, fontWeight: '500' },
   deviceChipTextActive: { color: '#ffffff', fontWeight: '700' },
   sectionTitle: {

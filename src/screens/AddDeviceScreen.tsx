@@ -95,7 +95,7 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
 
       if (!liveStates || Object.keys(liveStates).length === 0) {
         try {
-          const fresh = await probeDeviceAtAddress(device.ip, 1500);
+          const fresh = await probeDeviceAtAddress(device.ip, 1500, device.token);
           if (fresh?.states) liveStates = fresh.states;
         } catch {
           // ignore probe error
@@ -109,6 +109,8 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
         name: device.name || `${targetRoom} Controller`,
         room: targetRoom,
         ip: device.ip,
+        mac: device.mac,
+        token: device.token,
         type: '4-relay',
         online: true,
         mdns: dynamicDomain,
@@ -134,8 +136,8 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
       setDiscoveredBoards((prev) => prev.filter((d) => d.nodeId !== device.nodeId));
 
       Alert.alert(
-        'Board Linked',
-        `Bound "${dynamicDomain}" (${device.connectionMode === 'local' ? 'Local Wi-Fi' : 'Cloud'}) to ${targetRoom}.`,
+        'Board Linked & Secured',
+        `Bound "${dynamicDomain}" with hardware token to ${targetRoom}.`,
         [
           { text: 'Open Room', onPress: () => navigation.goBack() },
           { text: 'Add Another Board', style: 'cancel' },
@@ -179,20 +181,11 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
 
     const existingDevices = await getSavedDevices();
     const existingIds = new Set(existingDevices.map((d) => d.id));
-    const existingDomains = new Set(
-      existingDevices.map((d) => (d.mdns ? d.mdns.toLowerCase() : ''))
-    );
-
-    const isAlreadyAdded = (nodeId: string, mdns?: string): boolean => {
-      if (existingIds.has(nodeId)) return true;
-      const domain = getDynamicDomain(nodeId, mdns).toLowerCase();
-      return existingDomains.has(domain);
-    };
 
     const foundMap = new Map<string, DiscoveredDeviceWithMode>();
 
     const registerFoundBoard = (board: DiscoveredDevice, mode: DeviceConnectionMode) => {
-      if (!isAlreadyAdded(board.nodeId, board.mdns)) {
+      if (!existingIds.has(board.nodeId)) {
         if (!foundMap.has(board.nodeId) || mode === 'local') {
           foundMap.set(board.nodeId, { ...board, connectionMode: mode });
           setDiscoveredBoards(Array.from(foundMap.values()));
@@ -212,7 +205,6 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
       }
     }, 1000);
 
-    // Phase 1: SoftAP 192.168.4.1 Check
     setSearchStatus('Checking for setup mode (192.168.4.1)...');
     let detectedApBoard: DiscoveredDevice | null = null;
     const setupDeadline = Date.now() + 5000;
@@ -221,13 +213,13 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
       try {
         const apProbe = await probeDeviceAtAddress('192.168.4.1', 1000);
         if (apProbe && !isCancelledRef.current) {
-          if (!isAlreadyAdded(apProbe.nodeId, apProbe.mdns)) {
+          if (!existingIds.has(apProbe.nodeId)) {
             detectedApBoard = apProbe;
             break;
           }
         }
       } catch {
-        // Retry probe
+        // probe retry
       }
 
       if (Date.now() < setupDeadline) {
@@ -248,15 +240,6 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
     if (isCancelledRef.current) {
       clearInterval(intervalTimer);
       return;
-    }
-
-    // Phase 2: Cloud Registry Fetch + Multi-Subnet Sweep
-    setSearchStatus('Checking cloud device registry...');
-    try {
-      const cloudDevices = await fetchReportedDevicesFromCloud();
-      cloudDevices.forEach((dev) => registerFoundBoard(dev, 'cloud'));
-    } catch {
-      // ignore
     }
 
     const subnets = ['192.168.0', '192.168.1', '192.168.29'];
@@ -335,7 +318,7 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
 
         Alert.alert(
           'Wi-Fi Configured',
-          `ESP32 is rebooting and joining "${selectedSsid}". Connect your phone back to your home Wi-Fi and tap scan to add it to ${targetRoom}.`,
+          `ESP32 has received credentials and closed SoftAP. Connect your mobile back to "${selectedSsid}" to complete pairing.`,
           [
             {
               text: 'Scan Home Network',
@@ -350,10 +333,7 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
       }
     } catch {
       setIsProvisioning(false);
-      Alert.alert(
-        'Error',
-        'Could not communicate with setup gateway. Ensure your phone remains connected to the board hotspot.'
-      );
+      Alert.alert('Error', 'Could not communicate with setup gateway.');
     }
   };
 
@@ -396,6 +376,9 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
             <View style={styles.cardPrimary}>
               <Text style={styles.cardTitle}>Setup Mode Board Detected</Text>
               <Text style={styles.cardSubtitle}>{setupBoard.nodeId}</Text>
+              {setupBoard.token && (
+                <Text style={styles.cardTokenText}>Token: {setupBoard.token.substring(0, 8)}••••••••</Text>
+              )}
               <Text style={styles.cardDomainText}>Gateway: 192.168.4.1 (SoftAP)</Text>
               <TouchableOpacity
                 style={styles.actionBtnPrimary}
@@ -424,36 +407,10 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
                     ]}
                   >
                     <View style={{ flex: 1 }}>
-                      <View style={styles.badgeRow}>
-                        <Text style={styles.cardTitle}>{board.name || board.nodeId}</Text>
-                        <View
-                          style={[
-                            styles.connectionBadge,
-                            isLocal ? styles.badgeLocal : styles.badgeCloud,
-                          ]}
-                        >
-                          <View
-                            style={[
-                              styles.badgeDot,
-                              { backgroundColor: isLocal ? '#10b981' : '#38bdf8' },
-                            ]}
-                          />
-                          <Text
-                            style={[
-                              styles.badgeText,
-                              { color: isLocal ? '#34d399' : '#38bdf8' },
-                            ]}
-                          >
-                            {isLocal ? 'Local Wi-Fi' : 'Cloud Registry'}
-                          </Text>
-                        </View>
-                      </View>
-
+                      <Text style={styles.cardTitle}>{board.name || board.nodeId}</Text>
                       <Text style={styles.cardSubtitle}>{board.nodeId}</Text>
                       <Text style={styles.cardDomainText}>
-                        {isLocal
-                          ? `LAN: ${board.ip} (${domain})`
-                          : 'Synced via Firebase RTDB'}
+                        {isLocal ? `LAN: ${board.ip} (${domain})` : 'Synced via Cloud'}
                       </Text>
                     </View>
 
@@ -464,7 +421,7 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
                       ]}
                       onPress={() => storeAndFinish(board)}
                     >
-                      <Text style={styles.actionBtnText}>+ Add</Text>
+                      <Text style={styles.actionBtnText}>+ Pair</Text>
                     </TouchableOpacity>
                   </View>
                 );
@@ -476,8 +433,7 @@ export const AddDeviceScreen: React.FC<AddDeviceScreenProps> = ({ navigation, ro
             <View style={styles.guideCard}>
               <Text style={styles.guideTitle}>No New Boards Discovered</Text>
               <Text style={styles.guideText}>
-                • All active boards on this network are already assigned to a room.{'\n'}
-                • Ensure unassigned boards are connected to the same Wi-Fi network as this phone.{'\n'}
+                • Ensure unassigned boards are connected to the same Wi-Fi network.{'\n'}
                 • For a fresh board, connect to "SapthaNest-Setup-XXXX" (Password: nest1234) and configure it first.
               </Text>
               <TouchableOpacity style={styles.retryBtn} onPress={executeSearch}>
@@ -613,51 +569,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#334155',
   },
-  cardBorderLocal: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
-  },
-  cardBorderCloud: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#0284c7',
-  },
-  badgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  connectionBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-    borderRadius: 6,
-  },
-  badgeLocal: {
-    backgroundColor: '#064e3b',
-    borderWidth: 1,
-    borderColor: '#059669',
-  },
-  badgeCloud: {
-    backgroundColor: '#0c4a6e',
-    borderWidth: 1,
-    borderColor: '#0284c7',
-  },
-  badgeDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    marginRight: 4,
-  },
-  badgeText: {
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.4,
-  },
+  cardBorderLocal: { borderLeftWidth: 4, borderLeftColor: '#10b981' },
+  cardBorderCloud: { borderLeftWidth: 4, borderLeftColor: '#0284c7' },
   cardTitle: { color: '#ffffff', fontSize: 15, fontWeight: '800' },
   cardSubtitle: { color: '#94a3b8', fontSize: 12, marginTop: 4 },
+  cardTokenText: { color: '#a5b4fc', fontSize: 11, marginTop: 2, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
   cardDomainText: { color: '#38bdf8', fontSize: 12, marginTop: 2, fontWeight: '600' },
   actionBtnPrimary: {
     backgroundColor: '#38bdf8',
@@ -672,12 +588,8 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginLeft: 12,
   },
-  btnLocal: {
-    backgroundColor: '#10b981',
-  },
-  btnCloud: {
-    backgroundColor: '#0284c7',
-  },
+  btnLocal: { backgroundColor: '#10b981' },
+  btnCloud: { backgroundColor: '#0284c7' },
   actionBtnText: { color: '#ffffff', fontWeight: '800', fontSize: 13 },
   guideCard: {
     backgroundColor: '#1e293b',

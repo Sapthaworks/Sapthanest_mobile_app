@@ -16,6 +16,8 @@ export interface DiscoveredCloudDevice {
   id: string;
   name: string;
   ip: string;
+  mac?: string;
+  token?: string;
   mdns?: string;
   online?: boolean;
   ownerId?: string | null;
@@ -31,9 +33,6 @@ const app = getApps().length === 0 ? initializeApp(FIREBASE_CONFIG) : getApp();
 const db = getDatabase(app);
 const FIREBASE_BASE_URL = FIREBASE_CONFIG.databaseURL;
 
-/**
- * Checks if the current Firebase user is anonymous or unauthenticated.
- */
 export const isAnonymousUser = (): boolean => {
   try {
     const auth = getAuth(app);
@@ -43,9 +42,6 @@ export const isAnonymousUser = (): boolean => {
   }
 };
 
-/**
- * Resolves the active user ID (defaults to 'default_user' if unauthenticated).
- */
 export const getEffectiveUserId = (fallbackUserId: string = 'default_user'): string => {
   try {
     const auth = getAuth(app);
@@ -55,10 +51,6 @@ export const getEffectiveUserId = (fallbackUserId: string = 'default_user'): str
   }
 };
 
-/**
- * Persists the user's configured room list to Firebase RTDB.
- * Blocked for anonymous/guest users.
- */
 export const syncRoomsToCloud = async (userId: string, rooms: string[]): Promise<void> => {
   if (isAnonymousUser()) return;
   const effectiveUid = getEffectiveUserId(userId);
@@ -69,10 +61,6 @@ export const syncRoomsToCloud = async (userId: string, rooms: string[]): Promise
   }
 };
 
-/**
- * Fetches all rooms stored under the user's cloud account.
- * Returns an empty array for anonymous users.
- */
 export const fetchUserRooms = async (userId: string): Promise<string[]> => {
   if (isAnonymousUser()) return [];
   const effectiveUid = getEffectiveUserId(userId);
@@ -89,91 +77,16 @@ export const fetchUserRooms = async (userId: string): Promise<string[]> => {
   }
 };
 
-/**
- * Deletes a room from the user's room list in Firebase RTDB.
- * Handles both Array and Object/Dictionary room schemas.
- */
-export const deleteRoomFromFirebase = async (
-  userId: string,
-  roomName: string
-): Promise<void> => {
-  if (isAnonymousUser()) return;
-
-  const effectiveUid = getEffectiveUserId(userId);
-  const roomsRef = ref(db, `users/${effectiveUid}/rooms`);
-
-  try {
-    const snapshot = await get(roomsRef);
-    if (snapshot.exists()) {
-      const data = snapshot.val();
-
-      if (Array.isArray(data)) {
-        const filteredRooms = data.filter((r) => r !== roomName);
-        await set(roomsRef, filteredRooms);
-      } else if (typeof data === 'object' && data !== null) {
-        let matchedKey: string | null = null;
-        for (const [key, val] of Object.entries(data)) {
-          if (val === roomName || key === roomName) {
-            matchedKey = key;
-            break;
-          }
-        }
-
-        if (matchedKey) {
-          await remove(ref(db, `users/${effectiveUid}/rooms/${matchedKey}`));
-        } else {
-          await remove(ref(db, `users/${effectiveUid}/rooms/${encodeURIComponent(roomName)}`));
-        }
-      }
-    }
-  } catch (err: any) {
-    console.warn('[Firebase] SDK room removal failed, invoking REST fallback:', err.message);
-    try {
-      // Direct REST fallback attempt
-      const res = await fetch(`${FIREBASE_BASE_URL}/users/${effectiveUid}/rooms.json`);
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          const filteredRooms = data.filter((r) => r !== roomName);
-          await fetch(`${FIREBASE_BASE_URL}/users/${effectiveUid}/rooms.json`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(filteredRooms),
-          });
-        } else if (typeof data === 'object' && data !== null) {
-          const keyToDelete = Object.keys(data).find(
-            (k) => data[k] === roomName || k === roomName
-          );
-          if (keyToDelete) {
-            await fetch(
-              `${FIREBASE_BASE_URL}/users/${effectiveUid}/rooms/${encodeURIComponent(keyToDelete)}.json`,
-              { method: 'DELETE' }
-            );
-          }
-        }
-      }
-    } catch (restErr: any) {
-      console.error('[Firebase] Failed to delete room via REST:', restErr.message);
-    }
-  }
-};
-
-/**
- * Links a board to a user in Firebase and establishes default switch/triac states.
- * Blocked for anonymous users.
- */
 export const linkDeviceToUser = async (
   userId: string,
   device: SapthaDevice
 ): Promise<void> => {
-  if (isAnonymousUser()) {
-    return;
-  }
+  if (isAnonymousUser()) return;
 
   const effectiveUid = getEffectiveUserId(userId);
 
   try {
-    // 1. User device reference
+    // 1. User device registration
     const userDeviceRef = ref(db, `users/${effectiveUid}/devices/${device.id}`);
     await set(userDeviceRef, {
       id: device.id,
@@ -181,22 +94,31 @@ export const linkDeviceToUser = async (
       room: device.room,
       mdns: device.mdns,
       ip: device.ip,
+      mac: device.mac || null,
+      token: device.token || null,
       linkedAt: Date.now(),
     });
 
-    // 2. Hardware device metadata
+    // 2. Hardware device metadata registration
     const deviceMetaRef = ref(db, `devices/${device.id}/meta`);
     await update(deviceMetaRef, {
       nodeId: device.id,
       ip: device.ip,
       name: device.name,
       mdns: device.mdns,
+      mac: device.mac || null,
       ownerId: effectiveUid,
       room: device.room,
       online: true,
     });
 
-    // 3. Ensure hardware states default cleanly (relays false, triacs 0)
+    // 3. Save board secret token to Firebase if present
+    if (device.token) {
+      const secretRef = ref(db, `devices/${device.id}/secret`);
+      await set(secretRef, device.token);
+    }
+
+    // 4. Default hardware channel states
     const deviceStateRef = ref(db, `devices/${device.id}/state`);
     const existingState = await get(deviceStateRef);
     if (!existingState.exists()) {
@@ -211,34 +133,9 @@ export const linkDeviceToUser = async (
     }
   } catch (err: any) {
     console.error(`[Firebase] Failed to link board ${device.id}:`, err.message);
-
-    // REST Fallback
-    try {
-      await fetch(
-        `${FIREBASE_BASE_URL}/users/${effectiveUid}/devices/${device.id}.json`,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: device.id,
-            name: device.name,
-            room: device.room,
-            mdns: device.mdns,
-            ip: device.ip,
-            linkedAt: Date.now(),
-          }),
-        }
-      );
-    } catch (restErr: any) {
-      throw new Error(`Cloud sync failed: ${restErr.message}`);
-    }
   }
 };
 
-/**
- * Removes a board from both the user's registry and the global hardware table.
- * Blocked for anonymous users.
- */
 export const unlinkDeviceFromUser = async (
   userId: string,
   deviceId: string
@@ -266,10 +163,6 @@ export const unlinkDeviceFromUser = async (
   }
 };
 
-/**
- * Real-time listener for board hardware states.
- * Disabled for anonymous users to prevent rule permission errors.
- */
 export const subscribeToDeviceState = (
   deviceId: string,
   onStateUpdate: (states: DeviceStates) => void
@@ -304,10 +197,6 @@ export const subscribeToDeviceState = (
   }
 };
 
-/**
- * Updates an individual channel's state in Firebase RTDB.
- * Blocked for anonymous users.
- */
 export const updateChannelState = async (
   deviceId: string,
   channel: RelayKey | TriacKey,
@@ -320,22 +209,9 @@ export const updateChannelState = async (
     await set(channelRef, value);
   } catch (err: any) {
     console.error(`[Firebase] Failed to update channel ${channel}:`, err.message);
-    try {
-      await fetch(`${FIREBASE_BASE_URL}/devices/${deviceId}/state/${channel}.json`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(value),
-      });
-    } catch {
-      // ignore REST fallback error
-    }
   }
 };
 
-/**
- * Fetches all boards linked to a specific user.
- * Returns an empty array for anonymous users.
- */
 export const fetchUserDevices = async (
   userId?: string
 ): Promise<any[]> => {
@@ -362,7 +238,6 @@ export default {
   getEffectiveUserId,
   syncRoomsToCloud,
   fetchUserRooms,
-  deleteRoomFromFirebase,
   linkDeviceToUser,
   unlinkDeviceFromUser,
   subscribeToDeviceState,
