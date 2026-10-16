@@ -77,6 +77,79 @@ export const fetchUserRooms = async (userId: string): Promise<string[]> => {
   }
 };
 
+export const renameRoomInCloud = async (
+  userId: string,
+  oldName: string,
+  newName: string,
+  deviceIds: string[] = []
+): Promise<void> => {
+  if (isAnonymousUser()) return;
+
+  const effectiveUid = getEffectiveUserId(userId);
+
+  try {
+    const currentRooms = await fetchUserRooms(effectiveUid);
+    const updatedRooms = currentRooms.map((r) => (r === oldName ? newName : r));
+    await set(ref(db, `users/${effectiveUid}/rooms`), updatedRooms);
+
+    for (const devId of deviceIds) {
+      await update(ref(db, `users/${effectiveUid}/devices/${devId}`), {
+        room: newName,
+      });
+      await update(ref(db, `devices/${devId}/meta`), {
+        room: newName,
+      });
+    }
+  } catch (err: any) {
+    console.warn('[Firebase] Failed to rename room in cloud:', err.message);
+    throw err;
+  }
+};
+
+export const updateChannelLabelInCloud = async (
+  userId: string,
+  deviceId: string,
+  channel: RelayKey | TriacKey,
+  label: string
+): Promise<void> => {
+  if (isAnonymousUser()) return;
+
+  const effectiveUid = getEffectiveUserId(userId);
+
+  try {
+    // 1. Update under user device registry
+    await update(ref(db, `users/${effectiveUid}/devices/${deviceId}/labels`), {
+      [channel]: label,
+    });
+    // 2. Update under global device metadata registry
+    await update(ref(db, `devices/${deviceId}/meta/labels`), {
+      [channel]: label,
+    });
+  } catch (err: any) {
+    console.warn(`[Firebase] Failed to update channel label:`, err.message);
+    try {
+      await fetch(
+        `${FIREBASE_BASE_URL}/users/${effectiveUid}/devices/${deviceId}/labels/${channel}.json`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(label),
+        }
+      );
+      await fetch(
+        `${FIREBASE_BASE_URL}/devices/${deviceId}/meta/labels/${channel}.json`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(label),
+        }
+      );
+    } catch (restErr: any) {
+      console.error('[Firebase] Failed to write label via REST fallback:', restErr.message);
+    }
+  }
+};
+
 export const linkDeviceToUser = async (
   userId: string,
   device: SapthaDevice
@@ -86,7 +159,6 @@ export const linkDeviceToUser = async (
   const effectiveUid = getEffectiveUserId(userId);
 
   try {
-    // 1. User device registration
     const userDeviceRef = ref(db, `users/${effectiveUid}/devices/${device.id}`);
     await set(userDeviceRef, {
       id: device.id,
@@ -96,10 +168,10 @@ export const linkDeviceToUser = async (
       ip: device.ip,
       mac: device.mac || null,
       token: device.token || null,
+      labels: device.labels || null,
       linkedAt: Date.now(),
     });
 
-    // 2. Hardware device metadata registration
     const deviceMetaRef = ref(db, `devices/${device.id}/meta`);
     await update(deviceMetaRef, {
       nodeId: device.id,
@@ -107,18 +179,17 @@ export const linkDeviceToUser = async (
       name: device.name,
       mdns: device.mdns,
       mac: device.mac || null,
+      labels: device.labels || null,
       ownerId: effectiveUid,
       room: device.room,
       online: true,
     });
 
-    // 3. Save board secret token to Firebase if present
     if (device.token) {
       const secretRef = ref(db, `devices/${device.id}/secret`);
       await set(secretRef, device.token);
     }
 
-    // 4. Default hardware channel states
     const deviceStateRef = ref(db, `devices/${device.id}/state`);
     const existingState = await get(deviceStateRef);
     if (!existingState.exists()) {
@@ -238,6 +309,8 @@ export default {
   getEffectiveUserId,
   syncRoomsToCloud,
   fetchUserRooms,
+  renameRoomInCloud,
+  updateChannelLabelInCloud,
   linkDeviceToUser,
   unlinkDeviceFromUser,
   subscribeToDeviceState,

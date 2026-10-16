@@ -10,6 +10,9 @@ export interface DeviceStates {
   t2: number;
 }
 
+// Custom channel label mapping (e.g., { r1: "Bed Lamp", t1: "Ceiling Fan" })
+export type DeviceChannelLabels = Partial<Record<RelayKey | TriacKey, string>>;
+
 export type DeviceConnectionMode = 'local' | 'cloud';
 
 export interface SapthaDevice {
@@ -19,10 +22,11 @@ export interface SapthaDevice {
   ip: string;
   type: string;
   online: boolean;
-  token?: string; // High-entropy hardware authentication secret
+  token?: string;
   mac?: string;
   mdns?: string;
   addedAt?: number;
   connectionMode?: DeviceConnectionMode;
   states?: DeviceStates;
+  labels?: DeviceChannelLabels; // <--- Add this line
 }

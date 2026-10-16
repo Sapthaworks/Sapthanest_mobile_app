@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { SapthaDevice } from '../types/device';
+import { SapthaDevice, RelayKey, TriacKey } from '../types/device';
 
 const SAVED_DEVICES_KEY = '@sapthanest_devices';
 const USER_SESSION_KEY = '@sapthanest_user_session';
@@ -12,7 +12,6 @@ export interface UserSession {
   isLoggedIn: boolean;
 }
 
-// ---------------- Session Storage ----------------
 export const loadUserSession = async (): Promise<UserSession | null> => {
   try {
     const raw = await AsyncStorage.getItem(USER_SESSION_KEY);
@@ -39,9 +38,6 @@ export const clearUserSession = async (): Promise<void> => {
   }
 };
 
-/**
- * Purges all user data (rooms, devices, and session) from local storage on logout.
- */
 export const clearAllUserData = async (): Promise<void> => {
   try {
     await AsyncStorage.multiRemove([
@@ -56,7 +52,6 @@ export const clearAllUserData = async (): Promise<void> => {
 
 export const clearUserDataOnSignOut = clearAllUserData;
 
-// ---------------- Device Storage ----------------
 export const getSavedDevices = async (): Promise<SapthaDevice[]> => {
   try {
     const raw = await AsyncStorage.getItem(SAVED_DEVICES_KEY);
@@ -101,7 +96,33 @@ export const deleteDeviceFromStorage = async (deviceId: string): Promise<SapthaD
   }
 };
 
-// ---------------- Room Storage ----------------
+export const updateDeviceChannelLabelInStorage = async (
+  deviceId: string,
+  channel: RelayKey | TriacKey,
+  newLabel: string
+): Promise<SapthaDevice[]> => {
+  try {
+    const existing = await getSavedDevices();
+    const updated = existing.map((device) => {
+      if (device.id === deviceId) {
+        return {
+          ...device,
+          labels: {
+            ...(device.labels || {}),
+            [channel]: newLabel,
+          },
+        };
+      }
+      return device;
+    });
+    await AsyncStorage.setItem(SAVED_DEVICES_KEY, JSON.stringify(updated));
+    return updated;
+  } catch (error) {
+    console.error(`Failed to update label for device ${deviceId}:`, error);
+    throw error;
+  }
+};
+
 export const getSavedRooms = async (): Promise<string[]> => {
   try {
     const raw = await AsyncStorage.getItem(SAVED_ROOMS_KEY);
@@ -141,7 +162,33 @@ export const saveRoomToStorage = async (roomName: string): Promise<string[]> => 
   }
 };
 
-// ---------------- Delete Room and Associated Devices ----------------
+export const renameRoomInStorage = async (
+  oldName: string,
+  newName: string
+): Promise<{ updatedRooms: string[]; updatedDevices: SapthaDevice[] }> => {
+  try {
+    const [savedRooms, savedDevices] = await Promise.all([
+      getSavedRooms(),
+      getSavedDevices(),
+    ]);
+
+    const updatedRooms = savedRooms.map((r) => (r === oldName ? newName : r));
+    const updatedDevices = savedDevices.map((d) =>
+      d.room === oldName ? { ...d, room: newName } : d
+    );
+
+    await Promise.all([
+      AsyncStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(updatedRooms)),
+      AsyncStorage.setItem(SAVED_DEVICES_KEY, JSON.stringify(updatedDevices)),
+    ]);
+
+    return { updatedRooms, updatedDevices };
+  } catch (error) {
+    console.error(`Failed to rename room from "${oldName}" to "${newName}":`, error);
+    throw error;
+  }
+};
+
 export const deleteRoomAndItsDevices = async (roomName: string): Promise<void> => {
   try {
     const [savedRooms, savedDevices] = await Promise.all([
@@ -172,8 +219,10 @@ export default {
   saveDeviceToStorage,
   saveAllDevices,
   deleteDeviceFromStorage,
+  updateDeviceChannelLabelInStorage,
   getSavedRooms,
   saveRoomsToStorage,
   saveRoomToStorage,
+  renameRoomInStorage,
   deleteRoomAndItsDevices,
 };

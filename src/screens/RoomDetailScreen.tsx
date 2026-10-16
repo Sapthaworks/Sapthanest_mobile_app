@@ -7,6 +7,8 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   Alert,
+  Modal,
+  TextInput,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { RelayCard } from '../components/RelayCard';
@@ -15,6 +17,8 @@ import {
   subscribeToDeviceState,
   updateChannelState,
   unlinkDeviceFromUser,
+  renameRoomInCloud,
+  updateChannelLabelInCloud,
   isAnonymousUser,
 } from '../services/deviceService';
 import { sendDynamicChannelCommand } from '../services/localApi';
@@ -22,8 +26,15 @@ import {
   getSavedDevices,
   deleteDeviceFromStorage,
   deleteRoomAndItsDevices,
+  renameRoomInStorage,
+  updateDeviceChannelLabelInStorage,
 } from '../services/storage';
-import { DeviceStates, RelayKey, TriacKey, SapthaDevice } from '../types/device';
+import {
+  DeviceStates,
+  RelayKey,
+  TriacKey,
+  SapthaDevice,
+} from '../types/device';
 import { auth } from '../services/firebase';
 
 export interface RoomDetailScreenProps {
@@ -38,8 +49,19 @@ export interface RoomDetailScreenProps {
 }
 
 export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navigation }) => {
-  const roomName = route?.params?.roomName || 'Living Room';
+  const initialRoomName = route?.params?.roomName || 'Living Room';
   const currentUserId = route?.params?.userId || 'default_user';
+
+  const [currentRoomName, setCurrentRoomName] = useState(initialRoomName);
+  const [isRenameModalVisible, setIsRenameModalVisible] = useState(false);
+  const [newRoomNameInput, setNewRoomNameInput] = useState('');
+  const [isRenaming, setIsRenaming] = useState(false);
+
+  // Channel Rename Modal state
+  const [channelModalVisible, setChannelModalVisible] = useState(false);
+  const [channelToRename, setChannelToRename] = useState<RelayKey | TriacKey | null>(null);
+  const [channelLabelInput, setChannelLabelInput] = useState('');
+  const [isChannelRenaming, setIsChannelRenaming] = useState(false);
 
   const isGuest = auth.currentUser?.isAnonymous || isAnonymousUser();
 
@@ -61,7 +83,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
   const loadRoomDevices = useCallback(async () => {
     try {
       const saved = await getSavedDevices();
-      const roomFiltered = saved.filter((d) => d.room === roomName);
+      const roomFiltered = saved.filter((d) => d.room === currentRoomName);
       setDevices(roomFiltered);
 
       if (roomFiltered.length > 0) {
@@ -77,7 +99,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
     } finally {
       setLoading(false);
     }
-  }, [roomName]);
+  }, [currentRoomName]);
 
   useEffect(() => {
     loadRoomDevices();
@@ -113,13 +135,92 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 
   const activeDevice = devices.find((d) => d.id === selectedDeviceId);
 
+  const getLabel = (channel: RelayKey | TriacKey, defaultText: string): string => {
+    return activeDevice?.labels?.[channel] || defaultText;
+  };
+
+  const handleChannelLongPress = (channel: RelayKey | TriacKey, defaultText: string) => {
+    setChannelToRename(channel);
+    setChannelLabelInput(getLabel(channel, defaultText));
+    setChannelModalVisible(true);
+  };
+
+ const handleChannelRenameSubmit = async () => {
+  if (!channelToRename || !activeDevice) return;
+
+  const trimmed = channelLabelInput.trim();
+  if (!trimmed) {
+    Alert.alert('Required', 'Please enter a valid label.');
+    return;
+  }
+
+  setIsChannelRenaming(true);
+  try {
+    // 1. Save locally in AsyncStorage
+    await updateDeviceChannelLabelInStorage(activeDevice.id, channelToRename, trimmed);
+
+    // 2. Push immediately to Google Firebase
+    if (!isGuest) {
+      await updateChannelLabelInCloud(currentUserId, activeDevice.id, channelToRename, trimmed);
+    }
+
+    // 3. Update in-memory state
+    setDevices((prev) =>
+      prev.map((d) =>
+        d.id === activeDevice.id
+          ? { ...d, labels: { ...(d.labels || {}), [channelToRename]: trimmed } }
+          : d
+      )
+    );
+
+    setChannelModalVisible(false);
+    setChannelToRename(null);
+    setChannelLabelInput('');
+  } catch (error: any) {
+    console.error('Rename failed:', error);
+    Alert.alert('Sync Error', error?.message || 'Failed to update name in Firebase.');
+  } finally {
+    setIsChannelRenaming(false);
+  }
+};
+
+  const handleRenameSubmit = async () => {
+    const trimmed = newRoomNameInput.trim();
+    if (!trimmed) {
+      Alert.alert('Required', 'Please enter a valid room name.');
+      return;
+    }
+    if (trimmed === currentRoomName) {
+      setIsRenameModalVisible(false);
+      return;
+    }
+
+    setIsRenaming(true);
+    try {
+      const deviceIds = devices.map((d) => d.id);
+      await renameRoomInStorage(currentRoomName, trimmed);
+
+      if (!isGuest) {
+        await renameRoomInCloud(currentUserId, currentRoomName, trimmed, deviceIds);
+      }
+
+      setCurrentRoomName(trimmed);
+      setIsRenameModalVisible(false);
+      setNewRoomNameInput('');
+      Alert.alert('Success', `Room renamed to "${trimmed}".`);
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Failed to rename room.');
+    } finally {
+      setIsRenaming(false);
+    }
+  };
+
   const handleRelayToggle = async (channel: RelayKey, nextState: boolean) => {
     if (!selectedDeviceId || !activeDevice) return;
 
     pendingUpdatesRef.current[channel] = Date.now() + 1200;
     setStates((prev) => ({ ...prev, [channel]: nextState }));
 
-    // Local request includes hardware authorization key
     const localSuccess = await sendDynamicChannelCommand(
       {
         id: activeDevice.id,
@@ -161,7 +262,6 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
     pendingUpdatesRef.current[channel] = Date.now() + 1000;
     setStates((prev) => ({ ...prev, [channel]: nextValue }));
 
-    // Local request includes hardware authorization key
     const localSuccess = await sendDynamicChannelCommand(
       {
         id: activeDevice.id,
@@ -209,7 +309,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
                 await unlinkDeviceFromUser(currentUserId, deviceId);
               }
               const updated = await deleteDeviceFromStorage(deviceId);
-              const remaining = updated.filter((d) => d.room === roomName);
+              const remaining = updated.filter((d) => d.room === currentRoomName);
               setDevices(remaining);
               setSelectedDeviceId(remaining.length > 0 ? remaining[0].id : '');
             } catch {
@@ -224,7 +324,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
   const handleDeleteRoom = () => {
     Alert.alert(
       'Delete Room',
-      `Delete "${roomName}"? This will permanently delete all ${devices.length} board(s) from this phone and the cloud database.`,
+      `Delete "${currentRoomName}"? This will permanently delete all ${devices.length} board(s) from this phone and the cloud database.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -237,7 +337,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
                   await unlinkDeviceFromUser(currentUserId, device.id);
                 }
               }
-              await deleteRoomAndItsDevices(roomName);
+              await deleteRoomAndItsDevices(currentRoomName);
               navigation?.goBack();
             } catch {
               Alert.alert('Error', 'Failed to delete room.');
@@ -252,7 +352,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
     return (
       <SafeAreaView style={styles.centerContainer}>
         <ActivityIndicator size="large" color="#38bdf8" />
-        <Text style={styles.loadingText}>Loading {roomName}...</Text>
+        <Text style={styles.loadingText}>Loading {currentRoomName}...</Text>
       </SafeAreaView>
     );
   }
@@ -271,9 +371,19 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
             <Text style={styles.backBtnText}>‹ Back</Text>
           </TouchableOpacity>
 
-          <Text style={styles.roomTitle} numberOfLines={1}>
-            {roomName}
-          </Text>
+          <TouchableOpacity
+            style={styles.titleWrapper}
+            onPress={() => {
+              setNewRoomNameInput(currentRoomName);
+              setIsRenameModalVisible(true);
+            }}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.roomTitle} numberOfLines={1}>
+              {currentRoomName}
+            </Text>
+            <Text style={styles.editPencil}> ✏️</Text>
+          </TouchableOpacity>
 
           <View style={styles.headerActionGroup}>
             <TouchableOpacity style={styles.deleteRoomButton} onPress={handleDeleteRoom}>
@@ -282,7 +392,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 
             <TouchableOpacity
               style={styles.scanButton}
-              onPress={() => navigation.navigate('AddDevice', { roomName, userId: currentUserId })}
+              onPress={() => navigation.navigate('AddDevice', { roomName: currentRoomName, userId: currentUserId })}
             >
               <Text style={styles.scanButtonText}>+ Add ESP32</Text>
             </TouchableOpacity>
@@ -328,7 +438,7 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
             </Text>
             <TouchableOpacity
               style={styles.noDeviceAction}
-              onPress={() => navigation.navigate('AddDevice', { roomName, userId: currentUserId })}
+              onPress={() => navigation.navigate('AddDevice', { roomName: currentRoomName, userId: currentUserId })}
             >
               <Text style={styles.noDeviceActionText}>+ Link New ESP32</Text>
             </TouchableOpacity>
@@ -356,52 +466,146 @@ export const RoomDetailScreen: React.FC<RoomDetailScreenProps> = ({ route, navig
 
         {activeDevice && (
           <>
-            <Text style={styles.sectionTitle}>AC Relays (Switches)</Text>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.sectionTitle}>AC Relays (Switches)</Text>
+              <Text style={styles.hintText}>Hold to rename</Text>
+            </View>
+
             <RelayCard
               channelKey="r1"
-              label="Switch 1"
+              label={getLabel('r1', 'Switch 1')}
               subLabel="Relay 1 • GPIO 23"
               isOn={states.r1}
               onToggle={handleRelayToggle}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Switch 1')}
             />
             <RelayCard
               channelKey="r2"
-              label="Switch 2"
+              label={getLabel('r2', 'Switch 2')}
               subLabel="Relay 2 • GPIO 22"
               isOn={states.r2}
               onToggle={handleRelayToggle}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Switch 2')}
             />
             <RelayCard
               channelKey="r3"
-              label="Switch 3"
+              label={getLabel('r3', 'Switch 3')}
               subLabel="Relay 3 • GPIO 21"
               isOn={states.r3}
               onToggle={handleRelayToggle}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Switch 3')}
             />
             <RelayCard
               channelKey="r4"
-              label="Socket 4"
+              label={getLabel('r4', 'Socket 4')}
               subLabel="Relay 4 • GPIO 19"
               isOn={states.r4}
               onToggle={handleRelayToggle}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Socket 4')}
             />
 
-            <Text style={styles.sectionTitle}>AC Phase Regulators (Dimmers)</Text>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.sectionTitle}>AC Phase Regulators (Dimmers)</Text>
+              <Text style={styles.hintText}>Hold to rename</Text>
+            </View>
+
             <TriacCard
               channelKey="t1"
-              label="Ceiling Fan (Triac 1)"
+              label={getLabel('t1', 'Ceiling Fan (Triac 1)')}
               value={states.t1}
               onValueChange={handleTriacChange}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Ceiling Fan')}
             />
             <TriacCard
               channelKey="t2"
-              label="Mood Dimmer (Triac 2)"
+              label={getLabel('t2', 'Mood Dimmer (Triac 2)')}
               value={states.t2}
               onValueChange={handleTriacChange}
+              onLongPress={(ch) => handleChannelLongPress(ch, 'Mood Dimmer')}
             />
           </>
         )}
       </ScrollView>
+
+      {/* Rename Room Modal */}
+      <Modal visible={isRenameModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Rename Room</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={newRoomNameInput}
+              onChangeText={setNewRoomNameInput}
+              placeholder="Enter new room name"
+              placeholderTextColor="#64748b"
+              autoFocus
+            />
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setIsRenameModalVisible(false)}
+                disabled={isRenaming}
+              >
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSaveBtn}
+                onPress={handleRenameSubmit}
+                disabled={isRenaming}
+              >
+                {isRenaming ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.modalSaveText}>Save</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Rename Switch / Speed Controller Modal */}
+      <Modal visible={channelModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Rename Control</Text>
+            <Text style={styles.modalSub}>
+              Set a custom name for this {channelToRename?.startsWith('r') ? 'switch' : 'regulator'}.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              value={channelLabelInput}
+              onChangeText={setChannelLabelInput}
+              placeholder="e.g., Table Lamp, Balcony Light, Exhaust"
+              placeholderTextColor="#64748b"
+              autoFocus
+            />
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => {
+                  setChannelModalVisible(false);
+                  setChannelToRename(null);
+                }}
+                disabled={isChannelRenaming}
+              >
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSaveBtn}
+                onPress={handleChannelRenameSubmit}
+                disabled={isChannelRenaming}
+              >
+                {isChannelRenaming ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.modalSaveText}>Save</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -414,7 +618,9 @@ const styles = StyleSheet.create({
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   backBtn: { paddingVertical: 6, paddingHorizontal: 4 },
   backBtnText: { color: '#38bdf8', fontSize: 16, fontWeight: '700' },
-  roomTitle: { fontSize: 19, fontWeight: '800', color: '#f8fafc', flex: 1, textAlign: 'center', marginHorizontal: 8 },
+  titleWrapper: { flexDirection: 'row', alignItems: 'center', flex: 1, justifyContent: 'center', marginHorizontal: 8 },
+  roomTitle: { fontSize: 18, fontWeight: '800', color: '#f8fafc', maxWidth: '80%' },
+  editPencil: { fontSize: 14 },
   headerActionGroup: { flexDirection: 'row', alignItems: 'center' },
   deleteRoomButton: { backgroundColor: '#3f1d24', borderWidth: 1, borderColor: '#7f1d1d', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8, marginRight: 8 },
   deleteRoomButtonText: { color: '#f87171', fontWeight: '700', fontSize: 12 },
@@ -486,14 +692,83 @@ const styles = StyleSheet.create({
   deviceChipActive: { backgroundColor: '#0284c7', borderColor: '#38bdf8' },
   deviceChipText: { color: '#94a3b8', fontSize: 13, fontWeight: '500' },
   deviceChipTextActive: { color: '#ffffff', fontWeight: '700' },
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginTop: 18,
+    marginBottom: 8,
+  },
   sectionTitle: {
     fontSize: 13,
     fontWeight: '700',
     color: '#94a3b8',
     textTransform: 'uppercase',
-    marginTop: 18,
-    marginBottom: 8,
     letterSpacing: 0.6,
+  },
+  hintText: {
+    fontSize: 11,
+    color: '#64748b',
+    fontStyle: 'italic',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  modalCard: {
+    backgroundColor: '#0f172a',
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#1e293b',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#ffffff',
+    marginBottom: 4,
+  },
+  modalSub: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginBottom: 12,
+  },
+  modalInput: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 8,
+    color: '#ffffff',
+    padding: 12,
+    fontSize: 15,
+    marginBottom: 16,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+  modalCancelBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+  },
+  modalCancelText: {
+    color: '#94a3b8',
+    fontWeight: '600',
+  },
+  modalSaveBtn: {
+    backgroundColor: '#0284c7',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    minWidth: 70,
+    alignItems: 'center',
+  },
+  modalSaveText: {
+    color: '#ffffff',
+    fontWeight: '700',
   },
 });
 
